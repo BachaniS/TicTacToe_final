@@ -49,40 +49,64 @@ def mcts_search(env, root_state, q_table, iterations=1000):
     initial_legal_actions = env.get_legal_actions()
 
     if not initial_legal_actions:
-        print("No legal actions available at root state!")
-        return random.choice(env.get_legal_actions()) if env.get_legal_actions() else None
+        print("No legal actions at root state:", root_state)
+        return None
 
-    for _ in range(iterations):
+    for i in range(iterations):
         node = root
         temp_env = EphemeralTicTacToeEnv()
+        # Sync temp_env with root_state and original env
         temp_env.game.board = root_state[:, :, 0].copy()
         temp_env.game.ages = root_state[:, :, 1].copy()
         temp_env.game.owners = root_state[:, :, 2].copy()
-        temp_env.game.current_player = "X" if np.any(root_state[:, :, 0] == 1) else "O"
+        temp_env.game.current_player = env.game.current_player
+        temp_env.game.move_count = env.game.move_count
 
-        while node.is_fully_expanded(temp_env.get_legal_actions()) and node.children:
-            node = node.best_child()
+        # Verify initialization
+        temp_legal = temp_env.get_legal_actions()
+        if set(temp_legal) != set(initial_legal_actions):
+            print(f"Iteration {i}: Mismatch in legal actions - Initial: {initial_legal_actions}, Temp: {temp_legal}")
+            print(f"Root state: {root_state}")
+            print(f"Temp board: {temp_env.game.board}")
+
+        # Selection
+        while node.is_fully_expanded(temp_legal) and node.children:
+            node = node.best_child(c_param=2.0)
             temp_env.step(node.action)
+            temp_legal = temp_env.get_legal_actions()
 
-        legal_actions = temp_env.get_legal_actions()
-        if legal_actions and not node.is_fully_expanded(legal_actions):
-            action = random.choice(legal_actions)
-            next_obs, _, _, _ = temp_env.step(action)
+        # Expansion
+        unexplored_actions = [a for a in temp_legal if a not in node.children]
+        if unexplored_actions:
+            state_key = hash_state(temp_env._get_observation(temp_env.game.get_state()))
+            action = max(unexplored_actions, key=lambda x: q_table.get(state_key, np.zeros(9))[x])
+            next_obs, reward, done, _ = temp_env.step(action)
             node = node.expand(action, next_obs)
+            if done and reward == 1:
+                while node:
+                    node.visits += 1
+                    node.total_reward += 1
+                    node = node.parent
+                return action
+        else:
+            print(f"Iteration {i}: No unexplored actions. Legal: {temp_legal}, Children: {list(node.children.keys())}")
 
-        reward = simulate(temp_env, q_table)
+        # Simulation
+        reward = simulate(temp_env, q_table)  # Will fix epsilon below
+
+        # Backpropagation
         while node:
             node.visits += 1
             node.total_reward += reward
             node = node.parent
 
     if not root.children:
-        print("Warning: No children expanded in MCTS. Returning random legal action.")
+        print("Warning: No children expanded after iterations. Initial legal actions:", initial_legal_actions)
         return random.choice(initial_legal_actions)
 
     return max(root.children.items(), key=lambda x: x[1].visits)[0]
 
-def simulate(env, q_table, max_steps=20):
+def simulate(env, q_table, max_steps=20, epsilon=0.3):
     step_count = 0
     done = False
     total_reward = 0
@@ -92,7 +116,11 @@ def simulate(env, q_table, max_steps=20):
         if not legal_actions:
             break
         state_key = hash_state(env._get_observation(env.game.get_state()))
-        action = max(legal_actions, key=lambda x: q_table.get(state_key, np.zeros(9))[x])
+        if random.random() < epsilon:
+            action = random.choice(legal_actions)
+        else:
+            q_values = q_table.get(state_key, np.zeros(9))
+            action = max(legal_actions, key=lambda x: q_values[x])
         _, reward, done, _ = env.step(action)
         total_reward += reward
         step_count += 1
@@ -100,24 +128,28 @@ def simulate(env, q_table, max_steps=20):
     return total_reward
 
 def update_q_tables(game_history, q_table_x, q_table_o, alpha=0.1, gamma=0.9):
-    """Update Q-tables for both players based on gameplay data."""
     for state, action, reward, next_state, done, player in game_history:
         state_key = hash_state(state)
         next_state_key = hash_state(next_state)
         q_table = q_table_x if player == "X" else q_table_o
 
-        # Ensure keys exist
         if state_key not in q_table:
             q_table[state_key] = np.zeros(9)
         if next_state_key not in q_table:
             q_table[next_state_key] = np.zeros(9)
 
-        # Q-learning update
+        adjusted_reward = reward
+        if done and reward == 1 and player != game_history[-1][5]:  # Losing player
+            adjusted_reward = -1
+            print(f"Penalizing {player} for move {action} with reward {adjusted_reward}")
+
         current_q = q_table[state_key][action]
         best_next_q = np.max(q_table[next_state_key]) if not done else 0
-        q_table[state_key][action] = (1 - alpha) * current_q + alpha * (reward + gamma * best_next_q)
+        new_q = (1 - alpha) * current_q + alpha * (adjusted_reward + gamma * best_next_q)
+        q_table[state_key][action] = new_q
+        if adjusted_reward != reward:
+            print(f"Q[{state_key}][{action}] updated: {current_q:.4f} -> {new_q:.4f}")
 
-    # Save updated Q-tables
     with open("q_table_x.pkl", "wb") as f:
         pickle.dump(dict(q_table_x), f)
     with open("q_table_o.pkl", "wb") as f:
